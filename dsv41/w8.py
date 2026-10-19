@@ -14,6 +14,16 @@ import torch.nn.functional as F
 
 from .quant import dequant_fp8_block
 
+def _read_o_fp8_qdq() -> bool:
+    value = os.environ.get("DSV41_O_FP8_QDQ", "0")
+    if value not in ("0", "1"):
+        raise ValueError("DSV41_O_FP8_QDQ must be 0 (legacy) or 1 (reference QDQ)")
+    return value == "1"
+
+
+# Resolve before CUDA graph capture, not on every token. Restart to change numerics.
+# Opt in for 1017; leave existing entry points/checkpoints unchanged by default.
+O_FP8_QDQ = _read_o_fp8_qdq()
 ENABLED = os.environ.get("DSV41_W8", "1") == "1"
 MAX_TC_ROWS = 512  # rows handled by the tensor-core kernels (fp8_tc <= 16, fp8_tcw <= 64, fp8_tcg beyond); then dequantize + cuBLAS
 
@@ -86,6 +96,17 @@ def linear_w(x: torch.Tensor, w) -> torch.Tensor:
 def oproj_a(o: torch.Tensor, wo_a, n_groups: int, rank: int) -> torch.Tensor:
     """The block-diagonal o-projection: o [b, s, g, d] x wo_a (rows g*rank..(g+1)*rank use only group g) -> [b, s, g*rank]."""
     b, s, g, d = o.shape
+    if O_FP8_QDQ:
+        if d % 32:
+            raise ValueError("1017 o-projection requires groups of 32 activations")
+        # Reference Attention AND DSparkAttention quantize after inverse RoPE,
+        # before wo_a, even when wo_a has been dequantized to BF16. Do this
+        # outside the GEMM fallback so a quantization failure cannot be hidden.
+        if o.is_cuda:
+            from .fused import fake_quant_fp8
+        else:
+            from .quant import fake_quant_fp8  # small CPU numerical tests
+        o = fake_quant_fp8(o, 32)
     if not isinstance(wo_a, W8):
         return torch.einsum("bsgd,grd->bsgr", o, wo_a.view(n_groups, rank, -1)).flatten(2)
     if b * s <= MAX_TC_ROWS:
