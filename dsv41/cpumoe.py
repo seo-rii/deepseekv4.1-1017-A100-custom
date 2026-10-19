@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import ctypes
+import glob
 import hashlib
 import os
 import subprocess
+import tempfile
 
 import torch
 
@@ -16,38 +18,65 @@ def lib():
     global _lib
     if _lib is None:
         src = os.path.join(HERE, "cpu", "moe_cpu.cpp")
-        tag = hashlib.sha1(open(src, "rb").read()).hexdigest()[:12]
+        # The checkout may be copied between Sapphire Rapids and AVX2 machines.
+        # Native ISA flags belong in the cache key as well as the source bytes.
+        with open("/proc/cpuinfo") as f:
+            features = next((line for line in f if line.startswith("flags")), "")
+        if not {"avx2", "fma"}.issubset(features.split()):
+            raise RuntimeError("CPU MoE requires an x86 CPU with AVX2 and FMA")
+        with open(src, "rb") as f:
+            tag = hashlib.sha1(f.read() + features.encode()).hexdigest()[:12]
         so = os.path.join(HERE, "cpu", f".moe_cpu.{tag}.so")
         if not os.path.exists(so):
-            subprocess.run(["g++", "-O3", "-march=sapphirerapids", "-fopenmp", "-shared", "-fPIC", "-o", so, src], check=True)
-        _lib = ctypes.CDLL(so)
-        _lib.cpumoe_alloc.restype = ctypes.c_void_p
-        _lib.cpumoe_alloc.argtypes = [ctypes.c_size_t]
-        _lib.cpumoe_bw_test.restype = ctypes.c_double
-        _lib.cpumoe_bw_test.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int]
-        _lib.cpumoe_load_rows.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-        _lib.cpumoe_load_expert.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] + [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_int]
-        _lib.cpumoe_local_fraction.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-        _lib.cpumoe_local_fraction.restype = ctypes.c_double
-        _lib.cpumoe_forward.restype = ctypes.c_int
-        _lib.cpumoe_forward_ids.restype = ctypes.c_int
-        _lib.cpumoe_forward_ids.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 4 + [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            fd, temp = tempfile.mkstemp(prefix=".moe_cpu.", suffix=".so", dir=os.path.dirname(src))
+            os.close(fd)
+            try:
+                subprocess.run(["g++", "-O3", "-march=native", "-fopenmp", "-shared", "-fPIC", "-o", temp, src], check=True)
+                os.replace(temp, so)
+            finally:
+                if os.path.exists(temp):
+                    os.unlink(temp)
+        L = ctypes.CDLL(so)
+        L.cpumoe_alloc.restype = ctypes.c_void_p
+        L.cpumoe_alloc.argtypes = [ctypes.c_size_t]
+        L.cpumoe_bw_test.restype = ctypes.c_double
+        L.cpumoe_bw_test.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int]
+        L.cpumoe_load_rows.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        L.cpumoe_load_expert.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] + [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_int]
+        L.cpumoe_load_layer.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 3
+        L.cpumoe_local_fraction.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        L.cpumoe_local_fraction.restype = ctypes.c_double
+        L.cpumoe_forward.restype = ctypes.c_int
+        L.cpumoe_forward_ids.restype = ctypes.c_int
+        L.cpumoe_forward_ids.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 4 + [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                                             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_void_p, ctypes.c_void_p]
-        _lib.cpumoe_set_int8(int(os.environ.get("DSV41_CPU_INT8", "2")))
-        _lib.cpumoe_set_chunks(int(os.environ.get("DSV41_CH1", "96")), int(os.environ.get("DSV41_CH3", "64")))
+        L.cpumoe_init_list.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+        L.cpumoe_set_nodes.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        L.cpumoe_set_int8(int(os.environ.get("DSV41_CPU_INT8", "2")))
+        L.cpumoe_set_chunks(int(os.environ.get("DSV41_CH1", "96")), int(os.environ.get("DSV41_CH3", "64")))
         cpus = os.environ.get("DSV41_CPU_LIST") or default_cpu_list()  # e.g. "0-11,24-35,12-23,36-47" (node 0 first, then node 1)
         if cpus:
-            lst = []
-            for part in cpus.split(","):
-                a, _, b = part.partition("-")
-                lst.extend(range(int(a), int(b or a) + 1))
+            lst = _expand(cpus)
+            if len(set(lst)) != len(lst) or not set(lst).issubset(os.sched_getaffinity(0)):
+                raise ValueError("DSV41_CPU_LIST must contain distinct CPUs in the process affinity mask")
             arr = (ctypes.c_int * len(lst))(*lst)
-            got = _lib.cpumoe_init_list(arr, len(lst), int(os.environ.get("DSV41_CORES_PER_NODE", str(len(lst) // 2))))
+            cores_per_node = int(os.environ.get("DSV41_CORES_PER_NODE", str(len(lst))))
+            got = L.cpumoe_init_list(arr, len(lst), cores_per_node)
             assert got == len(lst), f"OpenMP gave {got} threads, wanted {len(lst)} (set OMP_THREAD_LIMIT / check cpu affinity)"
         else:
-            threads = int(os.environ.get("DSV41_CPU_THREADS", "24"))
-            cores_per_node = int(os.environ.get("DSV41_CORES_PER_NODE", "12"))
-            _lib.cpumoe_init(threads, cores_per_node)
+            lst = sorted(os.sched_getaffinity(0))[:int(os.environ.get("DSV41_CPU_THREADS", "24"))]
+            arr = (ctypes.c_int * len(lst))(*lst)
+            got = L.cpumoe_init_list(arr, len(lst), len(lst))
+            assert got == len(lst) and got > 0, "CPU MoE could not initialize workers"
+            cores_per_node = len(lst)
+        nodes = []
+        for i in range(0, len(lst), cores_per_node):
+            paths = glob.glob(f"/sys/devices/system/cpu/cpu{lst[i]}/node[0-9]*")
+            nodes.append(int(paths[0].rsplit("node", 1)[1]) if paths else 0)
+        if any(node >= 64 for node in nodes):
+            raise ValueError("CPU MoE supports NUMA node IDs below 64")
+        L.cpumoe_set_nodes((ctypes.c_int * len(nodes))(*nodes))
+        _lib = L
     return _lib
 
 
@@ -74,17 +103,22 @@ def default_cpu_list(reserve_cores: int | None = None) -> str:
     (all their hardware threads) per node (default DSV41_RESERVE_CORES=1) for the Python main thread, the CUDA
     driver and the hot-cache copy thread: with active OpenMP waiting the workers spin between layers and would
     otherwise starve those threads, and a busy hyperthread sibling slows the worker sharing its core."""
-    import glob
-    nodes = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
+    nodes = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"), key=lambda p: int(p.rsplit("node", 1)[1]))
+    allowed = os.sched_getaffinity(0)
     per_node = []
     for n in nodes:
         try:
-            per_node.append(_expand(open(os.path.join(n, "cpulist")).read().strip()))
+            with open(os.path.join(n, "cpulist")) as f:
+                cpus = [cpu for cpu in _expand(f.read().strip()) if cpu in allowed]
+            if cpus:
+                per_node.append(cpus)
         except OSError:
             return ""
     if not per_node:
         return ""
     r = int(os.environ.get("DSV41_RESERVE_CORES", "1")) if reserve_cores is None else reserve_cores
+    if r < 0:
+        raise ValueError("DSV41_RESERVE_CORES must be nonnegative")
     workers, reserved = [], []
     m = None
     for c in per_node:
@@ -125,6 +159,8 @@ class HostExperts:
     _warned = False
 
     def __init__(self, E: int, inter: int, dim: int):
+        if E <= 0 or inter <= 0 or inter > 4096 or inter % 256 or dim <= 0 or dim > 8192 or dim % 128:
+            raise ValueError("CPU MoE requires positive E, inter <= 4096 divisible by 256, and dim <= 8192 divisible by 128")
         self.E, self.inter, self.dim = E, inter, dim
         self.K = dim
         L = lib()
@@ -149,6 +185,8 @@ class HostExperts:
 
     def load_expert(self, e: int, w1: torch.Tensor, w3: torch.Tensor, s1: torch.Tensor, s3: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor):
         """CPU tensors (contiguous uint8/int8) straight from the checkpoint mmap."""
+        if e < 0 or e >= self.E or any(t.device.type != "cpu" for t in (w1, w3, s1, s3, w2, s2)):
+            raise ValueError("expert ID must be in range and source tensors must be on CPU")
         L = lib()
         srcs = [t.contiguous().view(torch.uint8) for t in (w1, w3, s1, s3, w2, s2)]
         for t, n in zip(srcs, (self.inter * self.rb13, self.inter * self.rb13, self.inter * self.rs13, self.inter * self.rs13, self.dim * self.rb2, self.dim * self.rs2)):
@@ -174,19 +212,29 @@ class HostExperts:
         """All experts of the layer at once (lists of E contiguous CPU tensors, e.g. mmap views of the checkpoint)."""
         L = lib()
         E = self.E
-        assert len(w1) == E
+        lists = (w1, w3, s1, s3, w2, s2)
+        if any(len(lst) != E for lst in lists):
+            raise ValueError("each expert tensor list must contain E tensors")
+        # Keep the actual contiguous copies alive, rather than the original
+        # noncontiguous tensors whose temporary .contiguous() buffers can die.
+        sources = [[t.contiguous() for t in lst] for lst in lists]
+        sizes = (self.inter * self.rb13, self.inter * self.rb13, self.inter * self.rs13, self.inter * self.rs13, self.dim * self.rb2, self.dim * self.rs2)
+        for tensors, size in zip(sources, sizes):
+            if any(t.device.type != "cpu" or t.numel() * t.element_size() != size for t in tensors):
+                raise ValueError("expert tensor must be a CPU tensor with the expected packed byte size")
         P = ctypes.c_void_p * E
-        ptrs = [P(*[t.contiguous().data_ptr() for t in lst]) for lst in (w1, w3, s1, s3, w2, s2)]
-        self._keep = (w1, w3, s1, s3, w2, s2)  # keep the source tensors alive during the copy
+        ptrs = [P(*[t.data_ptr() for t in lst]) for lst in sources]
         L.cpumoe_load_layer(ctypes.c_void_p(self.w13), ctypes.c_void_p(self.s13), ctypes.c_void_p(self.w2), ctypes.c_void_p(self.s2),
                             *ptrs, E, self.inter, self.dim)
-        self._keep = None
 
     def forward_ids(self, x_ptr: int, ids_ptr: int, wts_ptr: int, n: int, out_ptr: int, limit: float) -> None:
         """Lean entry for the decode loop: raw pointers to a bf16 [K] activation, int32 [n] expert ids, fp32 [n] weights
         and the fp32 [dim] output (all host memory, e.g. pinned tensors). No allocations, one ctypes call."""
         if n == 0:
+            ctypes.memset(out_ptr, 0, self.dim * ctypes.sizeof(ctypes.c_float))
             return
+        if n < 0 or n > 16:
+            raise ValueError("CPU MoE supports at most 16 selected experts")
         r = self._lib.cpumoe_forward_ids(self.w13, self.s13, self.w2, self.s2, self.bytes13, self.bytes_s13, self.bytes2, self.bytes_s2,
                                          ids_ptr, n, x_ptr, wts_ptr, out_ptr, self.K, self.inter, self.dim, limit, self.gu_ptr, self.h_ptr)
         assert r == 0
@@ -195,6 +243,8 @@ class HostExperts:
         """x_bf16: CPU bf16 [K]; returns fp32 [dim] = sum_e w_e * expert_e(x)."""
         L = lib()
         E = len(expert_ids)
+        if E > 16 or len(weights) != E or any(e < 0 or e >= self.E for e in expert_ids):
+            raise ValueError("invalid selected experts or routing weights")
         P = ctypes.c_void_p * E
         p13 = P(*[self.w13 + e * self.bytes13 for e in expert_ids])
         ps13 = P(*[self.s13 + e * self.bytes_s13 for e in expert_ids])
@@ -202,7 +252,7 @@ class HostExperts:
         ps2 = P(*[self.s2 + e * self.bytes_s2 for e in expert_ids])
         wts = (ctypes.c_float * E)(*weights)
         x = x_bf16.contiguous()
-        assert x.dtype == torch.bfloat16 and x.numel() == self.K
+        assert x.device.type == "cpu" and x.dtype == torch.bfloat16 and x.numel() == self.K
         r = L.cpumoe_forward(p13, ps13, p2, ps2, E, ctypes.c_void_p(x.data_ptr()), wts, ctypes.c_void_p(self.out.data_ptr()),
                              self.K, self.inter, self.dim, ctypes.c_float(limit),
                              ctypes.c_void_p(self.gu.data_ptr()), ctypes.c_void_p(self.h.data_ptr()))
