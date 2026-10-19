@@ -1,5 +1,21 @@
 # DeepSeek-V4.1-Flash on A100 (sm80)
 
+## 1017 / one-server work
+
+This fork targets the original **DeepSeek-V4.1-Flash-1017** checkpoint. Start with
+[the single-A100 instructions](docs/1017-single-a100.md) and the
+[one-server resource assessment](docs/1017-one-server-readiness.json).
+`run_1017_one_server.sh` queues real GPU kernel tests, a short benchmark, and then
+a localhost API, checking checkpoint/host RAM before waiting for idle GPU memory.
+It does not download weights or terminate other jobs.
+
+The observed one-server has one A100 80GB, about 236 GiB host RAM and 120 GiB free
+disk. This runtime needs at least 457.8 GiB for resident expert/Engram copies plus
+working memory, and the original checkpoint occupies 475.3 GiB on disk. Therefore
+the full model is currently blocked by host resources and missing weights.
+**No full-model 1017 TPS or quality result has been established.** The performance
+figures below are historical upstream results on different multi-GPU hardware.
+
 This repository contains a custom inference runtime for DeepSeek-V4.1-Flash on NVIDIA A100 GPUs. It keeps FP8 dense weights and packed FP4 MoE experts on GPU, uses Triton/CUDA kernels with BF16 tensor cores, and keeps the large Engram tables in host RAM.
 
 Updated 2026-09-16. The numbers below are from the live five-GPU server logs in `results/prefix-audit-20260916/`.
