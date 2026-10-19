@@ -1,0 +1,49 @@
+{
+  "observed_at": "2026-10-19T15:38:40.365411+00:00",
+  "host": "one-server",
+  "cpu": "AMD EPYC 7H12, 16 vCPUs, AVX2/FMA, no AVX512",
+  "gpu": "NVIDIA A100-SXM4-80GB, one GPU",
+  "checkpoint": {
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "weight_files": 48,
+    "weight_files_bytes": 510296708312,
+    "source": "https://huggingface.co/api/models/deepseek-ai/DeepSeek-V4.1-Flash-1017/revision/1bae0e1088993b9b82de08f59de5be5a34e42170?blobs=true",
+    "inference_config_source": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/resolve/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/config.json"
+  },
+  "requirements": {
+    "expert_bytes": 288777830400,
+    "engram_bytes": 202758032400,
+    "resident_weight_bytes": 491535862800,
+    "headroom_bytes": 8589934592,
+    "required_host_bytes": 500125797392
+  },
+  "server": {
+    "host_capacity_bytes": 253348982784,
+    "host_available_bytes": 242009436160,
+    "data_disk_available_bytes": 127276118016,
+    "checkpoint_present": false
+  },
+  "assessment": "Full model cannot run on the observed server: checkpoint absent, insufficient disk space and host RAM. VRAM waiting alone cannot resolve this. CPU portability and synthetic kernel validation do not establish full-model quality or TPS.",
+  "validation": {
+    "local": {
+      "python": "3.12",
+      "torch": "2.13.0+cpu",
+      "passed": 114,
+      "cuda_skipped": 14
+    },
+    "remote": {
+      "python": "3.12",
+      "torch": "2.13.0+cu130",
+      "passed": 114,
+      "cuda_skipped": 14,
+      "cuda_context_disabled": true,
+      "cuda_sources_compiled_sm80": 9,
+      "exit_code": 0,
+      "log": "/home/one/logs/deepseek1017-checks.2B2Yn2yg/checks.log",
+      "exit_status": "/home/one/logs/deepseek1017-checks.2B2Yn2yg/checks.exit"
+    },
+    "gpu_execution": "14 real-CUDA cases prepared for the shared-lock queue; not executed during CPU-only validation",
+    "full_model": "Not run: checkpoint missing and host resources insufficient"
+  }
+}

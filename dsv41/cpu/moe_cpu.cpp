@@ -1,6 +1,6 @@
 // CPU MoE for the single-GPU mode: the selected experts are computed on the CPU straight from the
-// packed FP4 weights in RAM (E2M1 nibbles -> bf16 via vpermw, AVX-512 BF16 dot products, fp32
-// accumulate, E8M0 block scale applied per 32 k). Only x (10 KB) and the MoE output (20 KB) cross PCIe.
+// packed FP4 weights in RAM (AVX-512 BF16/VNNI when available, otherwise AVX2 BF16/W4A8;
+// fp32 accumulation and an E8M0 block scale per 32 k). Only x and the MoE output cross PCIe.
 // Threads are pinned one per physical core; rows are split between the two NUMA nodes so both
 // memory controllers stream weights, and the weight pages are first-touched by the node that reads them.
 #include <immintrin.h>
@@ -15,11 +15,18 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#if defined(__AVX512BF16__) && defined(__AVX512VBMI__) && defined(__AVX512VNNI__)
+#define DSV41_AVX512 1
+#else
+#define DSV41_AVX512 0
+#endif
+
 static int g_threads = 24, g_cores_per_node = 12, g_nodes = 2;
 static int g_cpus[256];
+static int g_numa_nodes[8] = {0, 1, 2, 3, 4, 5, 6, 7};
 static cpu_set_t g_master_mask;  // the caller's affinity, restored after every entry point
 static int g_master_saved = 0;
-static void save_master() { if (!g_master_saved) { sched_getaffinity(0, sizeof(g_master_mask), &g_master_mask); g_master_saved = 1; } }
+static void save_master() { sched_getaffinity(0, sizeof(g_master_mask), &g_master_mask); g_master_saved = 1; }
 static void restore_master();
 // pin the calling OpenMP thread to its CPU. Threads torch's shared runtime re-creates inherit the
 // master's mask, so every parallel region re-pins (one cheap syscall per thread per region).
@@ -46,6 +53,8 @@ extern "C" void cpumoe_init(int threads, int cores_per_node) {
 }
 
 extern "C" int cpumoe_init_list(const int* cpus, int n, int cores_per_node) {
+    if (n <= 0 || n > 256 || cores_per_node <= 0 || n % cores_per_node != 0 || n / cores_per_node > 8) return -1;
+    for (int t = 0; t < n; ++t) if (cpus[t] < 0 || cpus[t] >= CPU_SETSIZE) return -1;
     save_master();
     g_threads = n; g_cores_per_node = cores_per_node; g_nodes = (n + cores_per_node - 1) / cores_per_node;
     for (int t = 0; t < n; ++t) g_cpus[t] = cpus[t];
@@ -59,6 +68,10 @@ extern "C" int cpumoe_init_list(const int* cpus, int n, int cores_per_node) {
     }
     restore_master();
     return got;  // number of threads actually provided by the runtime
+}
+
+extern "C" void cpumoe_set_nodes(const int* nodes) {
+    for (int n = 0; n < g_nodes; ++n) g_numa_nodes[n] = nodes[n];
 }
 
 extern "C" void* cpumoe_alloc(size_t bytes) {
@@ -84,7 +97,7 @@ extern "C" int cpumoe_bind_rows(uint8_t* base, int E, int N, int row_bytes) {
             uintptr_t a = (uintptr_t)base + ((size_t)e * N + n0) * row_bytes, b = (uintptr_t)base + ((size_t)e * N + n1) * row_bytes;
             a = (a + page - 1) & ~(uintptr_t)(page - 1); b &= ~(uintptr_t)(page - 1);
             if (b <= a) continue;
-            unsigned long mask = 1UL << node;
+            unsigned long mask = 1UL << g_numa_nodes[node];
             if (syscall(SYS_mbind, (void*)a, (size_t)(b - a), DSV41_MPOL_BIND, &mask, 64, 0) != 0) bad++;
         }
     return bad;
@@ -95,7 +108,7 @@ extern "C" int cpumoe_bind_rows(uint8_t* base, int E, int N, int row_bytes) {
 // free memory is fragmented by the page cache: measured 45 GB of node-1 rows on node 0, node-1 threads
 // 2x slower). One syscall per thread per region: no VMA splitting (mbind per range hit vm.max_map_count).
 #define DSV41_MPOL_DEFAULT 0
-static inline void bind_self_node(int node) { unsigned long mask = 1UL << node; syscall(SYS_set_mempolicy, DSV41_MPOL_BIND, &mask, 64); }
+static inline void bind_self_node(int node) { unsigned long mask = 1UL << g_numa_nodes[node]; syscall(SYS_set_mempolicy, DSV41_MPOL_BIND, &mask, 64); }
 static inline void unbind_self() { syscall(SYS_set_mempolicy, DSV41_MPOL_DEFAULT, nullptr, 0); }
 
 // Placement check: fraction of sampled pages (every 2 MiB) of node k's row half that actually live on node k.
@@ -109,7 +122,7 @@ extern "C" double cpumoe_local_fraction(const uint8_t* base, int E, int N, int r
             uintptr_t a2 = ((uintptr_t)a + (2 << 20) - 1) & ~(uintptr_t)((2 << 20) - 1);
             for (const uint8_t* p = (const uint8_t*)a2; p + (2 << 20) <= b; p += (2 << 20)) {
                 void* pages[1] = {(void*)p}; int status[1] = {-1};
-                if (syscall(SYS_move_pages, 0, 1, pages, nullptr, status, 0) == 0 && status[0] >= 0) { tot++; if (status[0] == node) ok++; }
+                if (syscall(SYS_move_pages, 0, 1, pages, nullptr, status, 0) == 0 && status[0] >= 0) { tot++; if (status[0] == g_numa_nodes[node]) ok++; }
             }
         }
     return tot ? (double)ok / tot : -1.0;
@@ -120,6 +133,7 @@ static inline int row_node(int n, int N) { return (int)((long)n * g_nodes / N); 
 
 // copy one expert matrix [N, row_bytes] into dst (first touch by the node that will read each row)
 extern "C" void cpumoe_load_rows(uint8_t* dst, const uint8_t* src, int N, int row_bytes) {
+    save_master();
     omp_set_dynamic(0); omp_set_num_threads(g_threads);
 #pragma omp parallel
     {
@@ -137,9 +151,10 @@ extern "C" void cpumoe_load_rows(uint8_t* dst, const uint8_t* src, int N, int ro
 
 // read bandwidth: node = -1 -> every thread reads its own node's half; node = k -> only node k's threads read node k's half
 extern "C" double cpumoe_bw_test(const uint8_t* p, size_t bytes, int iters, int node_sel) {
+    save_master();
     omp_set_dynamic(0); omp_set_num_threads(g_threads);
     double best = 0;
-    static volatile long sinks[64];
+    static volatile long sinks[256];
     for (int it = 0; it < iters; ++it) {
         double t0 = omp_get_wtime();
 #pragma omp parallel
@@ -150,9 +165,10 @@ extern "C" double cpumoe_bw_test(const uint8_t* p, size_t bytes, int iters, int 
                 size_t b0 = bytes * node / g_nodes, b1 = bytes * (node + 1) / g_nodes;
                 size_t per = (b1 - b0) / g_cores_per_node;
                 const uint8_t* a = p + b0 + tin * per;
-                __m512i acc = _mm512_setzero_si512();
-                for (size_t i = 0; i + 64 <= per; i += 64) acc = _mm512_add_epi64(acc, _mm512_loadu_si512(a + i));
-                sinks[t] = _mm512_reduce_add_epi64(acc);
+                __m256i acc = _mm256_setzero_si256();
+                for (size_t i = 0; i + 32 <= per; i += 32) acc = _mm256_add_epi64(acc, _mm256_loadu_si256((const __m256i*)(a + i)));
+                alignas(32) uint64_t sums[4]; _mm256_store_si256((__m256i*)sums, acc);
+                sinks[t] = sums[0] + sums[1] + sums[2] + sums[3];
             }
         }
         double dt = omp_get_wtime() - t0;
@@ -175,6 +191,7 @@ static inline float u32_as_f32(uint32_t u) { float f; memcpy(&f, &u, 4); return 
 
 // x: bf16[K] as uint16; w: packed [K/2]; s: e8m0 [K/32]
 static inline float dot_row(const uint8_t* __restrict w, const uint8_t* __restrict s, const uint16_t* __restrict x, int K) {
+#if DSV41_AVX512
     const __m512i lut = _mm512_load_si512(LUT_BF16);
     __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
     const int C = K / 32;
@@ -202,6 +219,27 @@ static inline float dot_row(const uint8_t* __restrict w, const uint8_t* __restri
         }
     }
     return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#else
+    // AVX2 hosts (including Zen 2 A100 servers) have no native BF16 dot product.
+    alignas(32) static const float lut[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < K; b += 32) {
+        __m256 block = _mm256_setzero_ps();
+        for (int j = 0; j < 32; j += 8) {
+            uint32_t packed; memcpy(&packed, w + (b + j) / 2, 4);
+            __m128i p = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(packed));
+            __m128i lo = _mm_and_si128(p, _mm_set1_epi32(15)), hi = _mm_srli_epi32(p, 4);
+            __m256i ids = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_unpacklo_epi32(lo, hi)), _mm_unpackhi_epi32(lo, hi), 1);
+            __m256 weights = _mm256_i32gather_ps(lut, ids, 4);
+            __m256 xv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(x + b + j))), 16));
+            block = _mm256_fmadd_ps(weights, xv, block);
+        }
+        float scale = s[b / 32] ? u32_as_f32((uint32_t)s[b / 32] << 23) : 0.f;
+        acc = _mm256_fmadd_ps(block, _mm256_set1_ps(scale), acc);
+    }
+    alignas(32) float sums[8]; _mm256_store_ps(sums, acc);
+    float out = 0.f; for (float v : sums) out += v; return out;
+#endif
 }
 
 static inline float bf16_to_f(uint16_t b);
@@ -234,6 +272,7 @@ static void quant_x_u8(const uint16_t* x, int K, uint8_t* xu, float* sx, uint8_t
 #define PF_DIST 4096  // software prefetch distance (bytes) for the weight rows
 #endif
 alignas(64) static const int32_t IDX4[16] = {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+#if DSV41_AVX512
 static inline void dot_row_v2(const uint8_t* __restrict w0, const uint8_t* __restrict s0, const uint8_t* __restrict w1, const uint8_t* __restrict s1,
                               const uint8_t* __restrict xe, const uint8_t* __restrict xo, const float* __restrict sx, int K, float* r0, float* r1) {
     const __m512i lut = _mm512_load_si512(LUT_S8);
@@ -273,8 +312,36 @@ static inline void dot_row_v2(const uint8_t* __restrict w0, const uint8_t* __res
     *r0 = _mm512_reduce_add_ps(acc0);
     *r1 = _mm512_reduce_add_ps(acc1);
 }
+#else
+// W4A8 with AVX2: the pairwise sums cannot saturate (2 * 255 * 12 < 32767).
+// Subtract the unsigned-activation offset before applying the per-32 scales.
+static inline float dot_row_vnni(const uint8_t* w, const uint8_t* s, const uint8_t* xu, const float* sx, int K) {
+    const __m128i lut = _mm_load_si128((const __m128i*)LUT_S8);
+    const __m128i mask = _mm_set1_epi8(15);
+    const __m256i ones = _mm256_set1_epi16(1), offset = _mm256_set1_epi8((char)128);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < K; b += 32) {
+        __m128i p = _mm_loadu_si128((const __m128i*)(w + b / 2));
+        __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(p, mask));
+        __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(p, 4), mask));
+        __m256i weights = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_unpacklo_epi8(lo, hi)), _mm_unpackhi_epi8(lo, hi), 1);
+        __m256i q = _mm256_loadu_si256((const __m256i*)(xu + b));
+        __m256i products = _mm256_madd_epi16(_mm256_maddubs_epi16(q, weights), ones);
+        __m256i correction = _mm256_madd_epi16(_mm256_maddubs_epi16(offset, weights), ones);
+        float scale = s[b / 32] ? u32_as_f32((uint32_t)s[b / 32] << 23) * sx[b / 32] : 0.f;
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(products, correction)), _mm256_set1_ps(scale), acc);
+    }
+    alignas(32) float sums[8]; _mm256_store_ps(sums, acc);
+    float out = 0.f; for (float v : sums) out += v; return out;
+}
+static inline void dot_row_vnni2(const uint8_t* w0, const uint8_t* s0, const uint8_t* w1, const uint8_t* s1,
+                                const uint8_t* xu, const float* sx, int K, float* r0, float* r1) {
+    *r0 = dot_row_vnni(w0, s0, xu, sx, K); *r1 = dot_row_vnni(w1, s1, xu, sx, K);
+}
+#endif
 
 // w: packed [K/2]; s: e8m0 [K/32]; xu: u8[K]; sx: fp32[K/32]
+#if DSV41_AVX512
 static inline float dot_row_vnni(const uint8_t* __restrict w, const uint8_t* __restrict s, const uint8_t* __restrict xu, const float* __restrict sx, int K) {
     const __m512i lut = _mm512_load_si512(LUT_S8);
     const __m512i m4 = _mm512_set1_epi16(0x0F);
@@ -332,6 +399,7 @@ static inline void dot_row_vnni2(const uint8_t* __restrict w0, const uint8_t* __
     *r1 = _mm512_reduce_add_ps(acc1);
 }
 
+#endif
 static inline float bf16_to_f(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
 static inline uint16_t f_to_bf16(float f) {  // round to nearest even
     uint32_t u; memcpy(&u, &f, 4);
@@ -377,15 +445,18 @@ static void swiglu_quant_cols(const float* gu, int inter, float wt, float limit,
 }
 
 // One MoE layer for one token. Pointers per selected expert (E of them).
-static int g_int8 = 2;
+static int g_int8 = DSV41_AVX512 ? 2 : 1;
 alignas(64) static int g_ctr1[16 * 8], g_ctr3[16 * 8];  // per-node dynamic work counters (one cache line each)
 static int g_ch1 = 96, g_ch3 = 64;  // max rows per dynamic work item (stage 1 / stage 3)
 extern "C" void cpumoe_set_chunks(int ch1, int ch3) { g_ch1 = ch1 > 0 ? ch1 : 64; g_ch3 = ch3 > 0 && ch3 <= 256 ? ch3 : 64; }
-extern "C" void cpumoe_set_int8(int on) { g_int8 = on; }
+extern "C" void cpumoe_set_int8(int on) { g_int8 = !DSV41_AVX512 && on == 2 ? 1 : on; }
 
 extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s13, const uint8_t* const* w2, const uint8_t* const* s2,
                               int E, const uint16_t* x, const float* wts, float* out, int K, int inter, int dim, float limit,
                               float* gu, uint16_t* h) {
+    // These bounds protect the fixed-size decode scratch buffers below.
+    if (E < 0 || E > 16 || K <= 0 || K > 8192 || K % 128 || inter <= 0 || inter > 4096 || inter % 256 || dim <= 0) return -1;
+    save_master();  // preserve affinity set by pin_main_thread after library initialization
     static int lut_ready = 0;
     if (!lut_ready) { init_lut(); init_lut_s8(); lut_ready = 1; }
     const double t_entry = omp_get_wtime();
@@ -422,11 +493,14 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
                 if (c >= total) break;
                 int e = c / nch, a = n0 + (c % nch) * CH, b = a + CH < n1 ? a + CH : n1;
                 int n = a;
+#if DSV41_AVX512
                 if (g_int8 == 2)
                     for (; n + 1 < b; n += 2)
                         dot_row_v2(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), w13[e] + (size_t)(n + 1) * (K / 2), s13[e] + (size_t)(n + 1) * (K / 32),
                                    xe, xo, sx, K, &gu[(size_t)e * N13 + n], &gu[(size_t)e * N13 + n + 1]);
-                else if (g_int8)
+                else
+#endif
+                if (g_int8)
                     for (; n + 1 < b; n += 2)
                         dot_row_vnni2(w13[e] + (size_t)n * (K / 2), s13[e] + (size_t)n * (K / 32), w13[e] + (size_t)(n + 1) * (K / 2), s13[e] + (size_t)(n + 1) * (K / 32),
                                       xu, sx, K, &gu[(size_t)e * N13 + n], &gu[(size_t)e * N13 + n + 1]);
@@ -465,6 +539,7 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
                 int a = n0 + c * CH, b = a + CH < n1 ? a + CH : n1;
                 float accs[256];
                 for (int i = 0; i < b - a; ++i) accs[i] = 0.f;
+#if DSV41_AVX512
                 if (g_int8 == 2) {
                     for (int e = 0; e < E; ++e) {
                         int n = a;
@@ -477,7 +552,9 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
                         for (; n < b; ++n)
                             accs[n - a] += dot_row_vnni(w2[e] + (size_t)n * (inter / 2), s2[e] + (size_t)n * (inter / 32), hu + (size_t)e * inter, sh + (size_t)e * (inter / 32), inter);
                     }
-                } else {
+                } else
+#endif
+                {
                     for (int n = a; n < b; ++n)
                         for (int e = 0; e < E; ++e)
                             accs[n - a] += g_int8
@@ -509,6 +586,7 @@ extern "C" int cpumoe_forward(const uint8_t* const* w13, const uint8_t* const* s
 extern "C" void cpumoe_load_layer(uint8_t* w13, uint8_t* s13, uint8_t* w2, uint8_t* s2,
                                   const uint8_t* const* sw1, const uint8_t* const* sw3, const uint8_t* const* ss1, const uint8_t* const* ss3,
                                   const uint8_t* const* sw2, const uint8_t* const* ss2, int E, int inter, int dim) {
+    save_master();
     omp_set_dynamic(0); omp_set_num_threads(g_threads);
     const size_t rb13 = dim / 2, rs13 = dim / 32, rb2 = inter / 2, rs2 = inter / 32;
     const size_t b13 = (size_t)2 * inter * rb13, bs13 = (size_t)2 * inter * rs13, b2 = (size_t)dim * rb2, bs2 = (size_t)dim * rs2;
@@ -547,7 +625,7 @@ extern "C" int cpumoe_forward_ids(const uint8_t* w13, const uint8_t* s13, const 
                                   const uint16_t* x, const float* wts, float* out, int K, int inter, int dim, float limit,
                                   float* gu, uint16_t* h) {
     const uint8_t* p13[16]; const uint8_t* ps13[16]; const uint8_t* p2[16]; const uint8_t* ps2[16];
-    if (E > 16) return -1;
+    if (E < 0 || E > 16) return -1;
     for (int j = 0; j < E; j++) { p13[j] = w13 + (size_t)ids[j] * b13; ps13[j] = s13 + (size_t)ids[j] * bs13; p2[j] = w2 + (size_t)ids[j] * b2; ps2[j] = s2 + (size_t)ids[j] * bs2; }
     return cpumoe_forward(p13, ps13, p2, ps2, E, x, wts, out, K, inter, dim, limit, gu, h);
 }
@@ -557,6 +635,7 @@ extern "C" int cpumoe_forward_ids(const uint8_t* w13, const uint8_t* s13, const 
 extern "C" void cpumoe_load_expert(uint8_t* w13, uint8_t* s13, uint8_t* w2, uint8_t* s2, int e,
                                    const uint8_t* src_w1, const uint8_t* src_w3, const uint8_t* src_s1, const uint8_t* src_s3,
                                    const uint8_t* src_w2, const uint8_t* src_s2, int inter, int dim) {
+    save_master();
     if (omp_get_max_threads() != g_threads) { omp_set_dynamic(0); omp_set_num_threads(g_threads); }
     const int N13 = 2 * inter, rb13 = dim / 2, rs13 = dim / 32, rb2 = inter / 2, rs2 = inter / 32;
 #pragma omp parallel
